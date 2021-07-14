@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"k8s.io/kops/cloudmock/aws/mockec2"
+	gcemock "k8s.io/kops/cloudmock/gce"
 	"k8s.io/kops/cmd/kops/util"
 	"k8s.io/kops/pkg/commands"
 	"k8s.io/kops/pkg/featureflag"
@@ -61,8 +62,8 @@ func (o *LifecycleTestOptions) AddDefaults() {
 	o.SrcDir = "../../tests/integration/update_cluster/" + o.SrcDir
 }
 
-// TestLifecycleMinimal runs the test on a minimum configuration, similar to kops create cluster minimal.example.com --zones us-west-1a
-func TestLifecycleMinimal(t *testing.T) {
+// TestLifecycleMinimalAWS runs the test on a minimum configuration, similar to kops create cluster minimal.example.com --zones us-west-1a
+func TestLifecycleMinimalAWS(t *testing.T) {
 	runLifecycleTestAWS(&LifecycleTestOptions{
 		t:      t,
 		SrcDir: "minimal",
@@ -74,6 +75,14 @@ func TestLifecycleMinimalOpenstack(t *testing.T) {
 		t:           t,
 		SrcDir:      "minimal_openstack",
 		ClusterName: "minimal-openstack.k8s.local",
+	})
+}
+
+func TestLifecycleMinimalGCE(t *testing.T) {
+	runLifecycleTestGCE(&LifecycleTestOptions{
+		t:           t,
+		SrcDir:      "minimal_gce",
+		ClusterName: "minimal-gce.example.com",
 	})
 }
 
@@ -99,6 +108,14 @@ func TestLifecyclePrivateKopeio(t *testing.T) {
 		t:      t,
 		SrcDir: "privatekopeio",
 		Shared: []string{"nat-a2345678", "nat-b2345678"},
+	})
+}
+
+// TestLifecycleIPv6 runs the test on a IPv6 topology
+func TestLifecycleIPv6(t *testing.T) {
+	runLifecycleTestAWS(&LifecycleTestOptions{
+		t:      t,
+		SrcDir: "minimal-ipv6",
 	})
 }
 
@@ -178,34 +195,11 @@ func runLifecycleTest(h *testutils.IntegrationTestHarness, o *LifecycleTestOptio
 
 	inputYAML := "in-" + o.Version + ".yaml"
 
-	factoryOptions := &util.FactoryOptions{}
-	factoryOptions.RegistryPath = "memfs://tests"
-
-	factory := util.NewFactory(factoryOptions)
-
 	beforeResources := AllAWSResources(cloud)
 
-	{
-		options := &CreateOptions{}
-		options.Filenames = []string{path.Join(o.SrcDir, inputYAML)}
+	factory := newIntegrationTest(o.ClusterName, o.SrcDir).
+		setupCluster(t, inputYAML, ctx, stdout)
 
-		err := RunCreate(ctx, factory, &stdout, options)
-		if err != nil {
-			t.Fatalf("error running %q create: %v", inputYAML, err)
-		}
-	}
-
-	{
-		options := &CreateSecretPublickeyOptions{}
-		options.ClusterName = o.ClusterName
-		options.Name = "admin"
-		options.PublicKeyPath = path.Join(o.SrcDir, "id_rsa.pub")
-
-		err := RunCreateSecretPublicKey(ctx, factory, &stdout, options)
-		if err != nil {
-			t.Fatalf("error running %q create: %v", inputYAML, err)
-		}
-	}
 	updateEnsureNoChanges(ctx, t, factory, o.ClusterName, stdout)
 
 	// Overrides
@@ -350,6 +344,15 @@ func AllOpenstackResources(c *openstack.MockCloud) map[string]interface{} {
 	return all
 }
 
+// AllGCEResources returns all resources
+func AllGCEResources(c *gcemock.MockGCECloud) map[string]interface{} {
+	all := make(map[string]interface{})
+	for k, v := range c.AllResources() {
+		all[k] = v
+	}
+	return all
+}
+
 func runLifecycleTestAWS(o *LifecycleTestOptions) {
 	o.AddDefaults()
 
@@ -411,32 +414,8 @@ func runLifecycleTestOpenstack(o *LifecycleTestOptions) {
 
 	inputYAML := "in-" + o.Version + ".yaml"
 
-	factoryOptions := &util.FactoryOptions{}
-	factoryOptions.RegistryPath = "memfs://tests"
-
-	factory := util.NewFactory(factoryOptions)
-
-	{
-		options := &CreateOptions{}
-		options.Filenames = []string{path.Join(o.SrcDir, inputYAML)}
-
-		err := RunCreate(ctx, factory, &stdout, options)
-		if err != nil {
-			t.Fatalf("error running %q create: %v", inputYAML, err)
-		}
-	}
-
-	{
-		options := &CreateSecretPublickeyOptions{}
-		options.ClusterName = o.ClusterName
-		options.Name = "admin"
-		options.PublicKeyPath = path.Join(o.SrcDir, "id_rsa.pub")
-
-		err := RunCreateSecretPublicKey(ctx, factory, &stdout, options)
-		if err != nil {
-			t.Fatalf("error running %q create: %v", inputYAML, err)
-		}
-	}
+	factory := newIntegrationTest(o.ClusterName, o.SrcDir).
+		setupCluster(t, inputYAML, ctx, stdout)
 
 	updateEnsureNoChanges(ctx, t, factory, o.ClusterName, stdout)
 
@@ -462,6 +441,58 @@ func runLifecycleTestOpenstack(o *LifecycleTestOptions) {
 	}
 }
 
+func runLifecycleTestGCE(o *LifecycleTestOptions) {
+	o.AddDefaults()
+
+	t := o.t
+
+	h := testutils.NewIntegrationTestHarness(o.t)
+	defer h.Close()
+
+	h.MockKopsVersion("1.21.0-alpha.1")
+
+	featureflag.ParseFlags("AlphaAllowGCE")
+
+	cloud := h.SetupMockGCE()
+
+	var beforeIds []string
+	for id := range AllGCEResources(cloud) {
+		beforeIds = append(beforeIds, id)
+	}
+	sort.Strings(beforeIds)
+
+	ctx := context.Background()
+
+	t.Logf("running lifecycle test for cluster %s", o.ClusterName)
+
+	var stdout bytes.Buffer
+	inputYAML := "in-" + o.Version + ".yaml"
+
+	factory := newIntegrationTest(o.ClusterName, o.SrcDir).
+		setupCluster(t, inputYAML, ctx, stdout)
+
+	updateEnsureNoChanges(ctx, t, factory, o.ClusterName, stdout)
+
+	{
+		options := &DeleteClusterOptions{}
+		options.Yes = true
+		options.ClusterName = o.ClusterName
+		if err := RunDeleteCluster(ctx, factory, &stdout, options); err != nil {
+			t.Fatalf("error running delete cluster %q: %v", o.ClusterName, err)
+		}
+	}
+
+	var afterIds []string
+	for id := range AllGCEResources(cloud) {
+		afterIds = append(afterIds, id)
+	}
+	sort.Strings(afterIds)
+
+	if !reflect.DeepEqual(beforeIds, afterIds) {
+		t.Fatalf("resources changed by cluster create / destroy: %v -> %v", beforeIds, afterIds)
+	}
+}
+
 func updateEnsureNoChanges(ctx context.Context, t *testing.T, factory *util.Factory, clusterName string, stdout bytes.Buffer) {
 	t.Helper()
 	options := &UpdateClusterOptions{}
@@ -471,8 +502,9 @@ func updateEnsureNoChanges(ctx context.Context, t *testing.T, factory *util.Fact
 
 	// We don't test it here, and it adds a dependency on kubectl
 	options.CreateKubecfg = false
+	options.ClusterName = clusterName
 
-	_, err := RunUpdateCluster(ctx, factory, clusterName, &stdout, options)
+	_, err := RunUpdateCluster(ctx, factory, &stdout, options)
 	if err != nil {
 		t.Fatalf("error running update cluster %q: %v", clusterName, err)
 	}
@@ -486,8 +518,9 @@ func updateEnsureNoChanges(ctx context.Context, t *testing.T, factory *util.Fact
 
 	// We don't test it here, and it adds a dependency on kubectl
 	options.CreateKubecfg = false
+	options.ClusterName = clusterName
 
-	results, err := RunUpdateCluster(ctx, factory, clusterName, &stdout, options)
+	results, err := RunUpdateCluster(ctx, factory, &stdout, options)
 	if err != nil {
 		t.Fatalf("error running update cluster %q: %v", clusterName, err)
 	}

@@ -37,9 +37,7 @@ const (
 				"Service": ["events.amazonaws.com", "sqs.amazonaws.com"]
 			},
 			"Action": "sqs:SendMessage",
-			"Resource": [
-				"arn:aws:sqs:{{ AWS_REGION }}:{{ ACCOUNT_ID }}:{{ SQS_QUEUE_NAME }}"
-			]
+			"Resource": "arn:aws:sqs:{{ AWS_REGION }}:{{ ACCOUNT_ID }}:{{ SQS_QUEUE_NAME }}"
 		}]
 	}`
 	DefaultMessageRetentionPeriod = 300
@@ -72,7 +70,7 @@ var (
 type NodeTerminationHandlerBuilder struct {
 	*AWSModelContext
 
-	Lifecycle *fi.Lifecycle
+	Lifecycle fi.Lifecycle
 }
 
 func (b *NodeTerminationHandlerBuilder) Build(c *fi.ModelBuilderContext) error {

@@ -19,9 +19,12 @@ package awstasks
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strconv"
 
 	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/klog/v2"
+	"k8s.io/kops/upup/pkg/fi/cloudup/terraformWriter"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/sqs"
@@ -34,11 +37,11 @@ import (
 // +kops:fitask
 type SQS struct {
 	Name      *string
-	Lifecycle *fi.Lifecycle
+	Lifecycle fi.Lifecycle
 
 	URL                    *string
 	MessageRetentionPeriod int
-	Policy                 fi.Resource // "inline" IAM policy
+	Policy                 fi.Resource
 
 	Tags map[string]string
 }
@@ -78,7 +81,7 @@ func (q *SQS) Find(c *fi.Context) (*SQS, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error getting SQS queue attributes: %v", err)
 	}
-	policy := fi.NewStringResource(*attributes.Attributes["Policy"])
+	actualPolicy := *attributes.Attributes["Policy"]
 	period, err := strconv.Atoi(*attributes.Attributes["MessageRetentionPeriod"])
 	if err != nil {
 		return nil, fmt.Errorf("error coverting MessageRetentionPeriod to int: %v", err)
@@ -91,14 +94,40 @@ func (q *SQS) Find(c *fi.Context) (*SQS, error) {
 		return nil, fmt.Errorf("error listing SQS queue tags: %v", err)
 	}
 
+	// We parse both as JSON; if the json forms are equal we pretend the actual value is the expected value
+	if q.Policy != nil {
+		expectedPolicy, err := fi.ResourceAsString(q.Policy)
+		if err != nil {
+			return nil, fmt.Errorf("error reading expected Policy for SQS %q: %v", aws.StringValue(q.Name), err)
+		}
+		expectedJson := make(map[string]interface{})
+		err = json.Unmarshal([]byte(expectedPolicy), &expectedJson)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing expected Policy for SQS %q: %v", aws.StringValue(q.Name), err)
+		}
+		actualJson := make(map[string]interface{})
+		err = json.Unmarshal([]byte(actualPolicy), &actualJson)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing actual Policy for SQS %q: %v", aws.StringValue(q.Name), err)
+		}
+
+		if reflect.DeepEqual(actualJson, expectedJson) {
+			klog.V(2).Infof("actual Policy was json-equal to expected; returning expected value")
+			actualPolicy = expectedPolicy
+		}
+	}
+
 	actual := &SQS{
 		Name:                   q.Name,
 		URL:                    url,
 		Lifecycle:              q.Lifecycle,
-		Policy:                 policy,
+		Policy:                 fi.NewStringResource(actualPolicy),
 		MessageRetentionPeriod: period,
 		Tags:                   intersectSQSTags(tags.Tags, q.Tags),
 	}
+
+	//Avoid flapping
+	q.Name = actual.Name
 
 	return actual, nil
 }
@@ -148,14 +177,14 @@ func (q *SQS) RenderAWS(t *awsup.AWSAPITarget, a, e, changes *SQS) error {
 }
 
 type terraformSQSQueue struct {
-	Name                    *string            `json:"name" cty:"name"`
-	MessageRetentionSeconds int                `json:"message_retention_seconds" cty:"message_retention_seconds"`
-	Policy                  *terraform.Literal `json:"policy" cty:"policy"`
-	Tags                    map[string]string  `json:"tags" cty:"tags"`
+	Name                    *string                  `json:"name" cty:"name"`
+	MessageRetentionSeconds int                      `json:"message_retention_seconds" cty:"message_retention_seconds"`
+	Policy                  *terraformWriter.Literal `json:"policy" cty:"policy"`
+	Tags                    map[string]string        `json:"tags" cty:"tags"`
 }
 
 func (_ *SQS) RenderTerraform(t *terraform.TerraformTarget, a, e, changes *SQS) error {
-	p, err := t.AddFile("aws_sqs_queue", *e.Name, "policy", e.Policy, false)
+	p, err := t.AddFileResource("aws_sqs_queue", *e.Name, "policy", e.Policy, false)
 	if err != nil {
 		return err
 	}
